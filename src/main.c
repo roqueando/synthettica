@@ -79,6 +79,20 @@
 #define SNARE_DURATION_S   0.3f
 #define SNARE_SAMPLES      ((uint32_t)(SAMPLE_RATE_HZ * SNARE_DURATION_S))
 
+// Snare trigger mode (compile-time flag):
+//   0 = quantized: fires on the offbeat, follows the tempo; button toggles it.
+//   1 = free:      fires immediately on each button press.
+// You can also pass -DSNARE_FREE_TRIGGER=ON to cmake instead of editing here.
+#ifndef SNARE_FREE_TRIGGER
+#define SNARE_FREE_TRIGGER 1
+#endif
+
+#if SNARE_FREE_TRIGGER
+#define SNARE_STATUS "FREE"
+#else
+#define SNARE_STATUS (g_snare_enabled ? "ON" : "OFF")
+#endif
+
 // Output mix levels.
 #define VOICE_MIX_LEVEL    0.45f
 #define KICK_LEVEL         0.60f
@@ -132,7 +146,8 @@ static float    g_kick_sweep_coeff;
 static float    g_kick_amp_coeff;
 
 // Snare state.
-static volatile bool     g_snare_enabled;   // toggled by button, fires on beat
+static volatile bool     g_snare_enabled;   // quantized mode: toggled by button
+static volatile bool     g_snare_trigger;   // free mode: set by button, cleared by callback
 static volatile uint32_t g_snare_flash;
 static uint32_t g_snare_time = SNARE_SAMPLES; // start inactive
 static uint32_t g_snare_tone_phase;
@@ -264,15 +279,26 @@ static bool audio_sample_callback(struct repeating_timer *timer) {
             }
             g_beat_flash = BEAT_FLASH_TICKS;
         } else {
+#if !SNARE_FREE_TRIGGER
             if (g_snare_enabled) {
                 trigger_snare();
                 g_snare_flash = SNARE_FLASH_TICKS;
             }
+#endif
         }
         g_step_even = !g_step_even;
         g_step_countdown = g_samples_per_half_beat;
     }
     g_step_countdown--;
+
+#if SNARE_FREE_TRIGGER
+    // Free mode: fire the snare immediately on button press.
+    if (g_snare_trigger) {
+        trigger_snare();
+        g_snare_trigger = false;
+        g_snare_flash = SNARE_FLASH_TICKS;
+    }
+#endif
 
     const float out = VOICE_MIX_LEVEL * mix
                     + KICK_LEVEL      * kick_sample()
@@ -312,7 +338,11 @@ static void poll_snare_button(void) {
         last  = now;
         count = 0;
         if (!now) {                 // pressed (active low)
+#if SNARE_FREE_TRIGGER
+            g_snare_trigger = true;
+#else
             g_snare_enabled = !g_snare_enabled;
+#endif
         }
     }
 }
@@ -347,7 +377,7 @@ static void update_display(float bpm) {
     snprintf(buf, sizeof(buf), "%u", (unsigned)bpm);
     ssd1306_draw_text(&g_display, 22, 24, buf, 1);
     ssd1306_draw_text(&g_display, 64, 24,  g_kick_enabled  ? "KON"  : "KOFF", 1);
-    ssd1306_draw_text(&g_display, 100, 24, g_snare_enabled ? "SON"  : "SOFF", 1);
+    ssd1306_draw_text(&g_display, 100, 24, SNARE_STATUS, 1);
 
     // Beat flash indicator (top-right, left square).
     if (g_beat_flash > 0) {
@@ -481,8 +511,8 @@ int main(void) {
                    (unsigned)g_voices[1].freq,
                    (unsigned)g_voices[2].freq,
                    (unsigned)bpm,
-                   g_kick_enabled  ? "ON" : "OFF",
-                   g_snare_enabled ? "ON" : "OFF");
+                   g_kick_enabled ? "ON" : "OFF",
+                   SNARE_STATUS);
         }
         tick++;
         sleep_ms(10);

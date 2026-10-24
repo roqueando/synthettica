@@ -21,6 +21,12 @@ target_link_libraries(sine_pwm
     hardware_i2c
     m
 )
+
+# Snare trigger mode: OFF = quantized (offbeat), ON = free (fires on press).
+option(SNARE_FREE_TRIGGER "Snare fires immediately on button press" OFF)
+if(SNARE_FREE_TRIGGER)
+    target_compile_definitions(sine_pwm PRIVATE SNARE_FREE_TRIGGER=1)
+endif()
 pico_enable_stdio_usb(sine_pwm 1)
 pico_enable_stdio_uart(sine_pwm 0)
 pico_add_extra_outputs(sine_pwm)
