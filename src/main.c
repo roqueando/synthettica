@@ -17,8 +17,9 @@
 // ---------------------------------------------------------------------------
 #define AUDIO_GPIO      7u    // PWM slice 3, channel B
 
-// Push button (active low, internal pull-up): toggles the kick drum on/off.
-#define BUTTON_GPIO     4u
+// Push buttons (active low, internal pull-up).
+#define BUTTON_KICK_GPIO   4u   // toggles the kick drum on/off
+#define BUTTON_SNARE_GPIO  5u   // fires the snare immediately (free-form)
 
 // Frequency potentiometers (one per voice).
 #define ADC_SINE_GPIO    26u
@@ -69,8 +70,23 @@
 #define KICK_DURATION_S   0.5f
 #define KICK_SAMPLES      ((uint32_t)(SAMPLE_RATE_HZ * KICK_DURATION_S))
 
-// Display beat indicator: how many 10 ms ticks to keep the square lit.
-#define BEAT_FLASH_TICKS  10u
+// Snare drum synthesis: body tone + white-noise burst, fast decay.
+#define SNARE_TONE_HZ      180.0f
+#define SNARE_TONE_AMP     0.5f
+#define SNARE_NOISE_AMP    0.7f
+#define SNARE_TONE_TAU_S   0.04f
+#define SNARE_NOISE_TAU_S  0.03f
+#define SNARE_DURATION_S   0.3f
+#define SNARE_SAMPLES      ((uint32_t)(SAMPLE_RATE_HZ * SNARE_DURATION_S))
+
+// Output mix levels.
+#define VOICE_MIX_LEVEL    0.45f
+#define KICK_LEVEL         0.60f
+#define SNARE_LEVEL        0.70f
+
+// Display indicator ticks (10 ms each).
+#define BEAT_FLASH_TICKS   10u
+#define SNARE_FLASH_TICKS  5u
 
 typedef enum {
     WAVE_SINE = 0,
@@ -99,11 +115,13 @@ static voice_t g_voices[3] = {
 static ssd1306_t g_display;
 static uint32_t g_disp_base; // slow-scrolling phase base for the mixed trace
 
-// Tempo / kick state shared between main loop and audio callback.
-static volatile uint32_t g_samples_per_beat;
+// Tempo / step clock shared between main loop and audio callback.
+// Steps are half-beats (8th notes): even = downbeat (kick), odd = offbeat (snare).
+static volatile uint32_t g_samples_per_half_beat;
 static volatile bool     g_kick_enabled;
 static volatile uint32_t g_beat_flash;
-static uint32_t          g_beat_countdown;
+static uint32_t          g_step_countdown;
+static bool              g_step_even;
 
 // Kick synthesis state (owned by the audio callback).
 static uint32_t g_kick_time = KICK_SAMPLES; // start inactive
@@ -112,6 +130,17 @@ static float    g_kick_freq;
 static float    g_kick_amp;
 static float    g_kick_sweep_coeff;
 static float    g_kick_amp_coeff;
+
+// Snare state.
+static volatile bool     g_snare_enabled;   // toggled by button, fires on beat
+static volatile uint32_t g_snare_flash;
+static uint32_t g_snare_time = SNARE_SAMPLES; // start inactive
+static uint32_t g_snare_tone_phase;
+static uint32_t g_snare_lfsr = 0x12345678u;
+static float    g_snare_tone_amp;
+static float    g_snare_noise_amp;
+static float    g_snare_tone_coeff;
+static float    g_snare_noise_coeff;
 
 static float g_sine_table[SINE_TABLE_SIZE];
 
@@ -182,6 +211,36 @@ static inline float kick_sample(void) {
     return s;
 }
 
+static void trigger_snare(void) {
+    g_snare_time       = 0;
+    g_snare_tone_phase = 0;
+    g_snare_tone_amp   = 1.0f;
+    g_snare_noise_amp  = 1.0f;
+    if (g_snare_lfsr == 0) g_snare_lfsr = 0x12345678u;
+}
+
+static inline float snare_sample(void) {
+    if (g_snare_time >= SNARE_SAMPLES) {
+        return 0.0f;
+    }
+
+    // White noise via a 32-bit xorshift LFSR -> [-1, 1).
+    g_snare_lfsr ^= g_snare_lfsr << 13;
+    g_snare_lfsr ^= g_snare_lfsr >> 17;
+    g_snare_lfsr ^= g_snare_lfsr << 5;
+    const float noise = ((float)(g_snare_lfsr & 0x00FFFFFFu) * (2.0f / 16777216.0f)) - 1.0f;
+
+    const float tone = sine_lookup(g_snare_tone_phase);
+
+    g_snare_tone_phase += (uint32_t)(SNARE_TONE_HZ * PHASE_PER_HZ);
+    g_snare_tone_amp   *= g_snare_tone_coeff;
+    g_snare_noise_amp  *= g_snare_noise_coeff;
+    g_snare_time++;
+
+    return SNARE_TONE_AMP  * tone  * g_snare_tone_amp
+         + SNARE_NOISE_AMP * noise * g_snare_noise_amp;
+}
+
 // ---------------------------------------------------------------------------
 // Audio callback
 // ---------------------------------------------------------------------------
@@ -197,30 +256,40 @@ static bool audio_sample_callback(struct repeating_timer *timer) {
     }
     mix *= (1.0f / (float)VOICE_COUNT); // normalized mix (multiply, no divide)
 
-    // Beat clock: trigger the kick on every beat (if enabled).
-    if (g_beat_countdown == 0) {
-        if (g_kick_enabled) {
-            trigger_kick();
+    // Step clock: downbeat fires the kick, offbeat fires the snare.
+    if (g_step_countdown == 0) {
+        if (g_step_even) {
+            if (g_kick_enabled) {
+                trigger_kick();
+            }
+            g_beat_flash = BEAT_FLASH_TICKS;
+        } else {
+            if (g_snare_enabled) {
+                trigger_snare();
+                g_snare_flash = SNARE_FLASH_TICKS;
+            }
         }
-        g_beat_flash = BEAT_FLASH_TICKS;
-        g_beat_countdown = g_samples_per_beat;
+        g_step_even = !g_step_even;
+        g_step_countdown = g_samples_per_half_beat;
     }
-    g_beat_countdown--;
+    g_step_countdown--;
 
-    const float out = 0.5f * mix + 0.8f * kick_sample();
+    const float out = VOICE_MIX_LEVEL * mix
+                    + KICK_LEVEL      * kick_sample()
+                    + SNARE_LEVEL     * snare_sample();
     pwm_set_gpio_level(AUDIO_GPIO, wave_to_duty(out));
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Button (debounced toggle)
+// Buttons (debounced)
 // ---------------------------------------------------------------------------
 
-static void poll_button(void) {
+static void poll_kick_button(void) {
     static bool     last  = true;   // idle high
     static uint32_t count = 0;
 
-    const bool now = gpio_get(BUTTON_GPIO);
+    const bool now = gpio_get(BUTTON_KICK_GPIO);
     if (now == last) {
         count = 0;
     } else if (++count >= 3) {      // stable for ~30 ms
@@ -228,6 +297,22 @@ static void poll_button(void) {
         count = 0;
         if (!now) {                 // pressed (active low)
             g_kick_enabled = !g_kick_enabled;
+        }
+    }
+}
+
+static void poll_snare_button(void) {
+    static bool     last  = true;
+    static uint32_t count = 0;
+
+    const bool now = gpio_get(BUTTON_SNARE_GPIO);
+    if (now == last) {
+        count = 0;
+    } else if (++count >= 3) {
+        last  = now;
+        count = 0;
+        if (!now) {                 // pressed (active low)
+            g_snare_enabled = !g_snare_enabled;
         }
     }
 }
@@ -261,10 +346,19 @@ static void update_display(float bpm) {
     ssd1306_draw_text(&g_display, 0, 24, "BPM", 1);
     snprintf(buf, sizeof(buf), "%u", (unsigned)bpm);
     ssd1306_draw_text(&g_display, 22, 24, buf, 1);
-    ssd1306_draw_text(&g_display, 76, 24, g_kick_enabled ? "KON" : "KOFF", 1);
+    ssd1306_draw_text(&g_display, 64, 24,  g_kick_enabled  ? "KON"  : "KOFF", 1);
+    ssd1306_draw_text(&g_display, 100, 24, g_snare_enabled ? "SON"  : "SOFF", 1);
 
-    // Beat flash indicator (top-right square).
+    // Beat flash indicator (top-right, left square).
     if (g_beat_flash > 0) {
+        for (int x = 112; x < 120; x++) {
+            for (int y = 0; y < 8; y++) {
+                ssd1306_set_pixel(&g_display, x, y, true);
+            }
+        }
+    }
+    // Snare hit indicator (top-right, right square).
+    if (g_snare_flash > 0) {
         for (int x = 120; x < SSD1306_WIDTH; x++) {
             for (int y = 0; y < 8; y++) {
                 ssd1306_set_pixel(&g_display, x, y, true);
@@ -298,8 +392,9 @@ int main(void) {
         g_voices[i].phase_step = default_step;
     }
 
-    g_samples_per_beat = (uint32_t)(SAMPLE_RATE_HZ * 60.0 / DEFAULT_BPM + 0.5);
-    g_beat_countdown   = g_samples_per_beat;
+    g_samples_per_half_beat = (uint32_t)(SAMPLE_RATE_HZ * 30.0 / DEFAULT_BPM + 0.5);
+    g_step_countdown        = g_samples_per_half_beat;
+    g_step_even             = true;
 
     // Precompute the sine wavetable (no sinf inside the audio callback).
     for (uint i = 0; i < SINE_TABLE_SIZE; i++) {
@@ -309,6 +404,10 @@ int main(void) {
     // Kick exponential decay coefficients (computed once).
     g_kick_sweep_coeff = expf(-1.0f / (SAMPLE_RATE_HZ * KICK_SWEEP_TAU_S));
     g_kick_amp_coeff   = expf(-1.0f / (SAMPLE_RATE_HZ * KICK_AMP_TAU_S));
+
+    // Snare exponential decay coefficients (computed once).
+    g_snare_tone_coeff  = expf(-1.0f / (SAMPLE_RATE_HZ * SNARE_TONE_TAU_S));
+    g_snare_noise_coeff = expf(-1.0f / (SAMPLE_RATE_HZ * SNARE_NOISE_TAU_S));
 
     // Audio output on GP7 (slice 3, channel B).
     gpio_set_function(AUDIO_GPIO, GPIO_FUNC_PWM);
@@ -324,10 +423,14 @@ int main(void) {
     adc_gpio_init(ADC_SAW_GPIO);
     adc_gpio_init(BPM_ADC_GPIO);
 
-    // Push button (active low, internal pull-up).
-    gpio_init(BUTTON_GPIO);
-    gpio_set_dir(BUTTON_GPIO, GPIO_IN);
-    gpio_pull_up(BUTTON_GPIO);
+    // Push buttons (active low, internal pull-up).
+    gpio_init(BUTTON_KICK_GPIO);
+    gpio_set_dir(BUTTON_KICK_GPIO, GPIO_IN);
+    gpio_pull_up(BUTTON_KICK_GPIO);
+
+    gpio_init(BUTTON_SNARE_GPIO);
+    gpio_set_dir(BUTTON_SNARE_GPIO, GPIO_IN);
+    gpio_pull_up(BUTTON_SNARE_GPIO);
 
     // OLED on I2C1 (GP14 SDA / GP15 SCL).
     i2c_init(OLED_I2C, 400 * 1000);
@@ -362,21 +465,24 @@ int main(void) {
         const uint16_t raw_bpm = read_adc_avg(BPM_ADC_CHAN);
         const float bpm_target = adc_to_bpm(raw_bpm);
         bpm += 0.15f * (bpm_target - bpm);
-        g_samples_per_beat = (uint32_t)(SAMPLE_RATE_HZ * 60.0 / bpm + 0.5);
+        g_samples_per_half_beat = (uint32_t)(SAMPLE_RATE_HZ * 30.0 / bpm + 0.5);
 
-        poll_button();
-        if (g_beat_flash > 0) g_beat_flash--;
+        poll_kick_button();
+        poll_snare_button();
+        if (g_beat_flash  > 0) g_beat_flash--;
+        if (g_snare_flash > 0) g_snare_flash--;
 
         if ((tick % 10) == 0) {
             update_display(bpm);
         }
         if ((tick % 20) == 0) {
-            printf("SIN=%4u SQR=%4u SAW=%4u BPM=%3u KICK=%s\n",
+            printf("SIN=%4u SQR=%4u SAW=%4u BPM=%3u KICK=%s SNR=%s\n",
                    (unsigned)g_voices[0].freq,
                    (unsigned)g_voices[1].freq,
                    (unsigned)g_voices[2].freq,
                    (unsigned)bpm,
-                   g_kick_enabled ? "ON" : "OFF");
+                   g_kick_enabled  ? "ON" : "OFF",
+                   g_snare_enabled ? "ON" : "OFF");
         }
         tick++;
         sleep_ms(10);
