@@ -68,7 +68,7 @@ void ssd1306_set_pixel(ssd1306_t *d, int x, int y, bool on) {
 }
 
 // 5x7 font, one byte per column, bit 0 = top row.
-static const uint8_t font5x7[23][5] = {
+static const uint8_t font5x7[29][5] = {
     {0x00, 0x00, 0x00, 0x00, 0x00}, // ' '  (0)
     {0x3E, 0x51, 0x49, 0x45, 0x3E}, // '0'  (1)
     {0x00, 0x42, 0x7F, 0x40, 0x00}, // '1'
@@ -92,6 +92,12 @@ static const uint8_t font5x7[23][5] = {
     {0x01, 0x01, 0x7F, 0x01, 0x01}, // 'T'  (20)
     {0x7E, 0x11, 0x11, 0x11, 0x7E}, // 'A'
     {0x3F, 0x40, 0x38, 0x40, 0x3F}, // 'W'
+    {0x7F, 0x49, 0x49, 0x49, 0x36}, // 'B'  (23)
+    {0x7F, 0x09, 0x09, 0x09, 0x06}, // 'P'
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, // 'M'
+    {0x7F, 0x08, 0x14, 0x22, 0x41}, // 'K'
+    {0x3E, 0x41, 0x41, 0x41, 0x22}, // 'C'
+    {0x3E, 0x41, 0x41, 0x41, 0x3E}, // 'O'
 };
 
 static int font_index(char c) {
@@ -110,6 +116,12 @@ static int font_index(char c) {
         case 'T': return 20;
         case 'A': return 21;
         case 'W': return 22;
+        case 'B': return 23;
+        case 'P': return 24;
+        case 'M': return 25;
+        case 'K': return 26;
+        case 'C': return 27;
+        case 'O': return 28;
         default: return 0;
     }
 }

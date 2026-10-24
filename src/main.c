@@ -7,6 +7,7 @@
 #include "hardware/timer.h"
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
+#include "hardware/gpio.h"
 #include "pico/stdio.h"
 
 #include "ssd1306.h"
@@ -16,7 +17,10 @@
 // ---------------------------------------------------------------------------
 #define AUDIO_GPIO      7u    // PWM slice 3, channel B
 
-// Frequency potentiometers (one per voice). RP2040 has 3 external ADCs.
+// Push button (active low, internal pull-up): toggles the kick drum on/off.
+#define BUTTON_GPIO     4u
+
+// Frequency potentiometers (one per voice).
 #define ADC_SINE_GPIO    26u
 #define ADC_SINE_CHAN    0u
 #define ADC_SQUARE_GPIO  27u
@@ -24,7 +28,11 @@
 #define ADC_SAW_GPIO     28u
 #define ADC_SAW_CHAN     2u
 
-// OLED on I2C1: SDA = GP14 (pin 19), SCL = GP15 (pin 20).
+// BPM potentiometer on GP29 = ADC3 (RP2040-Zero exposes GP29).
+#define BPM_ADC_GPIO     29u
+#define BPM_ADC_CHAN     3u
+
+// OLED on I2C1: SDA = GP14, SCL = GP15.
 #define OLED_I2C        i2c1
 #define OLED_SDA        14u
 #define OLED_SCL        15u
@@ -39,8 +47,30 @@
 #define FREQ_MAX_HZ      1000.0f
 #define DEFAULT_HZ       440.0f
 
-// Number of ADC reads averaged per control sample.
+#define BPM_MIN          10.0f
+#define BPM_MAX          120.0f
+#define DEFAULT_BPM      120.0f
+
 #define ADC_AVG_SAMPLES  8u
+
+// 2 full cycles across the 128px screen = 2^32 / 64.
+#define WAVE_PHASE_STEP  67108864u
+
+// Sine wavetable (avoids sinf/division inside the audio callback).
+#define SINE_TABLE_SIZE  1024u
+#define SINE_TABLE_SHIFT 22u    // 32 - log2(1024)
+#define PHASE_PER_HZ     (4294967296.0f / SAMPLE_RATE_HZ)
+
+// Kick drum synthesis (808-style: sine with pitch + amplitude decay).
+#define KICK_START_HZ     180.0f
+#define KICK_END_HZ       45.0f
+#define KICK_SWEEP_TAU_S  0.02f
+#define KICK_AMP_TAU_S    0.08f
+#define KICK_DURATION_S   0.5f
+#define KICK_SAMPLES      ((uint32_t)(SAMPLE_RATE_HZ * KICK_DURATION_S))
+
+// Display beat indicator: how many 10 ms ticks to keep the square lit.
+#define BEAT_FLASH_TICKS  10u
 
 typedef enum {
     WAVE_SINE = 0,
@@ -50,18 +80,18 @@ typedef enum {
 
 typedef struct {
     const char *label;
-    uint        adc_gpio;   // pot input
-    uint        adc_chan;   // ADC mux select
+    uint        adc_gpio;
+    uint        adc_chan;
     wave_kind_t wave;
-    uint32_t    phase;      // audio phase accumulator (owned by callback)
+    uint32_t    phase;      // owned by callback
     volatile uint32_t phase_step; // written by main loop, read by callback
-    float       freq;       // smoothed frequency (owned by main loop)
+    float       freq;       // owned by main loop
 } voice_t;
 
 static voice_t g_voices[3] = {
-    { "SIN", ADC_SINE_GPIO,   ADC_SINE_CHAN,   WAVE_SINE,     0, 0, DEFAULT_HZ },
-    { "SQR", ADC_SQUARE_GPIO, ADC_SQUARE_CHAN, WAVE_SQUARE,   0, 0, DEFAULT_HZ },
-    { "SAW", ADC_SAW_GPIO,    ADC_SAW_CHAN,    WAVE_SAW,       0, 0, DEFAULT_HZ },
+    { "SIN", ADC_SINE_GPIO,   ADC_SINE_CHAN,   WAVE_SINE,   0, 0, DEFAULT_HZ },
+    { "SQR", ADC_SQUARE_GPIO, ADC_SQUARE_CHAN, WAVE_SQUARE, 0, 0, DEFAULT_HZ },
+    { "SAW", ADC_SAW_GPIO,    ADC_SAW_CHAN,    WAVE_SAW,    0, 0, DEFAULT_HZ },
 };
 
 #define VOICE_COUNT (sizeof(g_voices) / sizeof(g_voices[0]))
@@ -69,11 +99,26 @@ static voice_t g_voices[3] = {
 static ssd1306_t g_display;
 static uint32_t g_disp_base; // slow-scrolling phase base for the mixed trace
 
+// Tempo / kick state shared between main loop and audio callback.
+static volatile uint32_t g_samples_per_beat;
+static volatile bool     g_kick_enabled;
+static volatile uint32_t g_beat_flash;
+static uint32_t          g_beat_countdown;
+
+// Kick synthesis state (owned by the audio callback).
+static uint32_t g_kick_time = KICK_SAMPLES; // start inactive
+static uint32_t g_kick_phase;
+static float    g_kick_freq;
+static float    g_kick_amp;
+static float    g_kick_sweep_coeff;
+static float    g_kick_amp_coeff;
+
+static float g_sine_table[SINE_TABLE_SIZE];
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Map a [-1, +1] waveform value to a PWM duty cycle, leaving headroom at both rails.
 static inline uint16_t wave_to_duty(float v) {
     float duty = (0.5f + 0.48f * v) * (float)PWM_TOP + 0.5f;
     if (duty < 0.0f) duty = 0.0f;
@@ -81,18 +126,19 @@ static inline uint16_t wave_to_duty(float v) {
     return (uint16_t)duty;
 }
 
-// Sample a waveform at normalized phase p in [0, 1).
-static inline float waveform_sample(wave_kind_t wave, float p) {
+static inline float sine_lookup(uint32_t phase) {
+    return g_sine_table[(phase >> SINE_TABLE_SHIFT) & (SINE_TABLE_SIZE - 1)];
+}
+
+static inline float waveform_sample(wave_kind_t wave, uint32_t phase) {
     switch (wave) {
-        case WAVE_SINE:     return sinf(p * TWO_PI);
-        case WAVE_SQUARE:   return (p < 0.5f) ? 1.0f : -1.0f;
-        case WAVE_SAW:      return 2.0f * p - 1.0f;
-        default:            return 0.0f;
+        case WAVE_SINE:   return sine_lookup(phase);
+        case WAVE_SQUARE: return (phase & 0x80000000u) ? 1.0f : -1.0f;
+        case WAVE_SAW:    return ((float)(phase >> 16) * (2.0f / 65536.0f)) - 1.0f;
+        default:          return 0.0f;
     }
 }
 
-// Read one ADC channel, discarding the first sample after the mux switch and
-// averaging the rest (rejects real noise).
 static uint16_t read_adc_avg(uint chan) {
     adc_select_input(chan);
     (void)adc_read(); // discard first sample (mux settling)
@@ -103,13 +149,41 @@ static uint16_t read_adc_avg(uint chan) {
     return (uint16_t)(sum / ADC_AVG_SAMPLES);
 }
 
-// Map a 12-bit ADC reading to a frequency in [FREQ_MIN_HZ, FREQ_MAX_HZ].
 static inline float adc_to_freq(uint16_t raw) {
     return FREQ_MIN_HZ + ((float)raw / 4095.0f) * (FREQ_MAX_HZ - FREQ_MIN_HZ);
 }
 
+static inline float adc_to_bpm(uint16_t raw) {
+    return BPM_MIN + ((float)raw / 4095.0f) * (BPM_MAX - BPM_MIN);
+}
+
 // ---------------------------------------------------------------------------
-// Audio: mix all voices into a single PWM output.
+// Kick drum
+// ---------------------------------------------------------------------------
+
+static void trigger_kick(void) {
+    g_kick_time  = 0;
+    g_kick_phase = 0;
+    g_kick_freq  = KICK_START_HZ;
+    g_kick_amp   = 1.0f;
+}
+
+static inline float kick_sample(void) {
+    if (g_kick_time >= KICK_SAMPLES) {
+        return 0.0f;
+    }
+    const float s = sine_lookup(g_kick_phase) * g_kick_amp;
+
+    g_kick_phase += (uint32_t)(g_kick_freq * PHASE_PER_HZ);
+    if (g_kick_freq > KICK_END_HZ) g_kick_freq *= g_kick_sweep_coeff;
+    else                           g_kick_freq  = KICK_END_HZ;
+    g_kick_amp *= g_kick_amp_coeff;
+    g_kick_time++;
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// Audio callback
 // ---------------------------------------------------------------------------
 
 static bool audio_sample_callback(struct repeating_timer *timer) {
@@ -118,21 +192,51 @@ static bool audio_sample_callback(struct repeating_timer *timer) {
     float mix = 0.0f;
     for (uint i = 0; i < VOICE_COUNT; i++) {
         voice_t *v = &g_voices[i];
-        const float p = (float)v->phase / 4294967296.0f;
-        mix += waveform_sample(v->wave, p);
+        mix += waveform_sample(v->wave, v->phase);
         v->phase += v->phase_step;
     }
-    mix /= (float)VOICE_COUNT; // normalize back to [-1, +1]
+    mix *= (1.0f / (float)VOICE_COUNT); // normalized mix (multiply, no divide)
 
-    pwm_set_gpio_level(AUDIO_GPIO, wave_to_duty(mix));
+    // Beat clock: trigger the kick on every beat (if enabled).
+    if (g_beat_countdown == 0) {
+        if (g_kick_enabled) {
+            trigger_kick();
+        }
+        g_beat_flash = BEAT_FLASH_TICKS;
+        g_beat_countdown = g_samples_per_beat;
+    }
+    g_beat_countdown--;
+
+    const float out = 0.5f * mix + 0.8f * kick_sample();
+    pwm_set_gpio_level(AUDIO_GPIO, wave_to_duty(out));
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Button (debounced toggle)
+// ---------------------------------------------------------------------------
+
+static void poll_button(void) {
+    static bool     last  = true;   // idle high
+    static uint32_t count = 0;
+
+    const bool now = gpio_get(BUTTON_GPIO);
+    if (now == last) {
+        count = 0;
+    } else if (++count >= 3) {      // stable for ~30 ms
+        last  = now;
+        count = 0;
+        if (!now) {                 // pressed (active low)
+            g_kick_enabled = !g_kick_enabled;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Display
 // ---------------------------------------------------------------------------
 
-static void update_display(void) {
+static void update_display(float bpm) {
     ssd1306_clear(&g_display);
 
     char buf[8];
@@ -140,31 +244,44 @@ static void update_display(void) {
 
     for (uint i = 0; i < VOICE_COUNT; i++) {
         const voice_t *v = &g_voices[i];
-        const int y = (int)i * 9;
+        const int y = (int)i * 8;
 
         ssd1306_draw_text(&g_display, 0, y, v->label, 1);
         snprintf(buf, sizeof(buf), "%u", (unsigned)v->freq);
         ssd1306_draw_text(&g_display, 22, y, buf, 1);
         ssd1306_draw_text(&g_display, 48, y, "Hz", 1);
 
-        // Per-voice per-pixel phase step so the trace reflects the real
-        // frequency ratio (440 Hz -> 2 cycles across the screen).
         float cycles = v->freq / 220.0f;
         if (cycles < 0.5f) cycles = 0.5f;
         if (cycles > 6.0f) cycles = 6.0f;
         step[i] = (uint32_t)(cycles * 4294967296.0 / (double)SSD1306_WIDTH);
     }
 
-    // Mixed trace: sum of the three waveforms at their current frequencies.
+    // BPM + kick status row.
+    ssd1306_draw_text(&g_display, 0, 24, "BPM", 1);
+    snprintf(buf, sizeof(buf), "%u", (unsigned)bpm);
+    ssd1306_draw_text(&g_display, 22, 24, buf, 1);
+    ssd1306_draw_text(&g_display, 76, 24, g_kick_enabled ? "KON" : "KOFF", 1);
+
+    // Beat flash indicator (top-right square).
+    if (g_beat_flash > 0) {
+        for (int x = 120; x < SSD1306_WIDTH; x++) {
+            for (int y = 0; y < 8; y++) {
+                ssd1306_set_pixel(&g_display, x, y, true);
+            }
+        }
+    }
+
+    // Mixed trace of the three voices.
     g_disp_base += 0x08000000u;
     for (int x = 0; x < SSD1306_WIDTH; x++) {
         float mix = 0.0f;
         for (uint i = 0; i < VOICE_COUNT; i++) {
             uint32_t ph = g_disp_base + (uint32_t)((uint64_t)x * step[i]);
-            mix += waveform_sample(g_voices[i].wave, (float)ph / 4294967296.0f);
+            mix += waveform_sample(g_voices[i].wave, ph);
         }
         mix /= (float)VOICE_COUNT;
-        int y = 47 - (int)(15.0f * mix);
+        int y = 48 - (int)(14.0f * mix);
         ssd1306_set_pixel(&g_display, x, y, true);
     }
 
@@ -181,18 +298,36 @@ int main(void) {
         g_voices[i].phase_step = default_step;
     }
 
-    // Single mixed output on GP7 (slice 3, channel B).
+    g_samples_per_beat = (uint32_t)(SAMPLE_RATE_HZ * 60.0 / DEFAULT_BPM + 0.5);
+    g_beat_countdown   = g_samples_per_beat;
+
+    // Precompute the sine wavetable (no sinf inside the audio callback).
+    for (uint i = 0; i < SINE_TABLE_SIZE; i++) {
+        g_sine_table[i] = sinf((float)i * TWO_PI / (float)SINE_TABLE_SIZE);
+    }
+
+    // Kick exponential decay coefficients (computed once).
+    g_kick_sweep_coeff = expf(-1.0f / (SAMPLE_RATE_HZ * KICK_SWEEP_TAU_S));
+    g_kick_amp_coeff   = expf(-1.0f / (SAMPLE_RATE_HZ * KICK_AMP_TAU_S));
+
+    // Audio output on GP7 (slice 3, channel B).
     gpio_set_function(AUDIO_GPIO, GPIO_FUNC_PWM);
     pwm_config config = pwm_get_default_config();
     pwm_config_set_clkdiv(&config, 1.0f);
     pwm_config_set_wrap(&config, PWM_TOP);
     pwm_init(pwm_gpio_to_slice_num(AUDIO_GPIO), &config, true);
 
-    // Potentiometer ADCs.
+    // Potentiometer ADCs (voices + BPM).
     adc_init();
     adc_gpio_init(ADC_SINE_GPIO);
     adc_gpio_init(ADC_SQUARE_GPIO);
     adc_gpio_init(ADC_SAW_GPIO);
+    adc_gpio_init(BPM_ADC_GPIO);
+
+    // Push button (active low, internal pull-up).
+    gpio_init(BUTTON_GPIO);
+    gpio_set_dir(BUTTON_GPIO, GPIO_IN);
+    gpio_pull_up(BUTTON_GPIO);
 
     // OLED on I2C1 (GP14 SDA / GP15 SCL).
     i2c_init(OLED_I2C, 400 * 1000);
@@ -202,7 +337,7 @@ int main(void) {
     gpio_pull_up(OLED_SCL);
     ssd1306_init(&g_display, OLED_I2C, OLED_ADDR, OLED_COL_OFFSET);
 
-    // USB CDC serial (printf). Safe: non-blocking, init does not wait for a host.
+    // USB CDC serial (printf).
     stdio_init_all();
 
     // Negative interval -> deadlines scheduled from the previous deadline (no drift).
@@ -212,25 +347,36 @@ int main(void) {
         while (true) tight_loop_contents();
     }
 
-    // Control loop: sample the pots at ~100 Hz, smooth, update phase steps.
+    // Control loop (~100 Hz): pots, button, display, log.
+    float bpm = DEFAULT_BPM;
     uint32_t tick = 0;
     while (true) {
         for (uint i = 0; i < VOICE_COUNT; i++) {
             voice_t *v = &g_voices[i];
             const uint16_t raw = read_adc_avg(v->adc_chan);
             const float target = adc_to_freq(raw);
-            v->freq += 0.15f * (target - v->freq); // exponential smoothing
+            v->freq += 0.15f * (target - v->freq);
             v->phase_step = (uint32_t)((v->freq * 4294967296.0) / (double)SAMPLE_RATE_HZ + 0.5);
         }
 
-        if ((tick % 10) == 0) { // display refresh at ~10 Hz
-            update_display();
+        const uint16_t raw_bpm = read_adc_avg(BPM_ADC_CHAN);
+        const float bpm_target = adc_to_bpm(raw_bpm);
+        bpm += 0.15f * (bpm_target - bpm);
+        g_samples_per_beat = (uint32_t)(SAMPLE_RATE_HZ * 60.0 / bpm + 0.5);
+
+        poll_button();
+        if (g_beat_flash > 0) g_beat_flash--;
+
+        if ((tick % 10) == 0) {
+            update_display(bpm);
         }
-        if ((tick % 20) == 0) { // log every ~200 ms
-            printf("SIN=%4u SQR=%4u SAW=%4u Hz\n",
+        if ((tick % 20) == 0) {
+            printf("SIN=%4u SQR=%4u SAW=%4u BPM=%3u KICK=%s\n",
                    (unsigned)g_voices[0].freq,
                    (unsigned)g_voices[1].freq,
-                   (unsigned)g_voices[2].freq);
+                   (unsigned)g_voices[2].freq,
+                   (unsigned)bpm,
+                   g_kick_enabled ? "ON" : "OFF");
         }
         tick++;
         sleep_ms(10);
