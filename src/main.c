@@ -21,8 +21,8 @@
 #define ADC_SINE_CHAN    0u
 #define ADC_SQUARE_GPIO  27u
 #define ADC_SQUARE_CHAN  1u
-#define ADC_TRI_GPIO     28u
-#define ADC_TRI_CHAN     2u
+#define ADC_SAW_GPIO     28u
+#define ADC_SAW_CHAN     2u
 
 // OLED on I2C1: SDA = GP14 (pin 19), SCL = GP15 (pin 20).
 #define OLED_I2C        i2c1
@@ -45,7 +45,7 @@
 typedef enum {
     WAVE_SINE = 0,
     WAVE_SQUARE,
-    WAVE_TRIANGLE,
+    WAVE_SAW,
 } wave_kind_t;
 
 typedef struct {
@@ -61,7 +61,7 @@ typedef struct {
 static voice_t g_voices[3] = {
     { "SIN", ADC_SINE_GPIO,   ADC_SINE_CHAN,   WAVE_SINE,     0, 0, DEFAULT_HZ },
     { "SQR", ADC_SQUARE_GPIO, ADC_SQUARE_CHAN, WAVE_SQUARE,   0, 0, DEFAULT_HZ },
-    { "TRI", ADC_TRI_GPIO,    ADC_TRI_CHAN,    WAVE_TRIANGLE, 0, 0, DEFAULT_HZ },
+    { "SAW", ADC_SAW_GPIO,    ADC_SAW_CHAN,    WAVE_SAW,       0, 0, DEFAULT_HZ },
 };
 
 #define VOICE_COUNT (sizeof(g_voices) / sizeof(g_voices[0]))
@@ -86,7 +86,7 @@ static inline float waveform_sample(wave_kind_t wave, float p) {
     switch (wave) {
         case WAVE_SINE:     return sinf(p * TWO_PI);
         case WAVE_SQUARE:   return (p < 0.5f) ? 1.0f : -1.0f;
-        case WAVE_TRIANGLE: return (p < 0.5f) ? (4.0f * p - 1.0f) : (3.0f - 4.0f * p);
+        case WAVE_SAW:      return 2.0f * p - 1.0f;
         default:            return 0.0f;
     }
 }
@@ -192,7 +192,7 @@ int main(void) {
     adc_init();
     adc_gpio_init(ADC_SINE_GPIO);
     adc_gpio_init(ADC_SQUARE_GPIO);
-    adc_gpio_init(ADC_TRI_GPIO);
+    adc_gpio_init(ADC_SAW_GPIO);
 
     // OLED on I2C1 (GP14 SDA / GP15 SCL).
     i2c_init(OLED_I2C, 400 * 1000);
@@ -227,7 +227,7 @@ int main(void) {
             update_display();
         }
         if ((tick % 20) == 0) { // log every ~200 ms
-            printf("SIN=%4u SQR=%4u TRI=%4u Hz\n",
+            printf("SIN=%4u SQR=%4u SAW=%4u Hz\n",
                    (unsigned)g_voices[0].freq,
                    (unsigned)g_voices[1].freq,
                    (unsigned)g_voices[2].freq);
