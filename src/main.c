@@ -1,6 +1,5 @@
 #include <math.h>
 #include <stdio.h>
-#include <string.h>
 #include <stdint.h>
 
 #include "pico/stdlib.h"
@@ -12,12 +11,18 @@
 
 #include "ssd1306.h"
 
-// Single sine output on GPIO 7 (PWM slice 3, channel B).
-#define GPIO_OUT        7u
+// ---------------------------------------------------------------------------
+// Single mixed audio output (PWM).
+// ---------------------------------------------------------------------------
+#define AUDIO_GPIO      7u    // PWM slice 3, channel B
 
-// Frequency potentiometer: wiper -> GP26 (ADC0), outer legs -> 3V3 and GND.
-#define FREQ_ADC_GPIO   26u
-#define FREQ_ADC_CHAN   0u
+// Frequency potentiometers (one per voice). RP2040 has 3 external ADCs.
+#define ADC_SINE_GPIO    26u
+#define ADC_SINE_CHAN    0u
+#define ADC_SQUARE_GPIO  27u
+#define ADC_SQUARE_CHAN  1u
+#define ADC_TRI_GPIO     28u
+#define ADC_TRI_CHAN     2u
 
 // OLED on I2C1: SDA = GP14 (pin 19), SCL = GP15 (pin 20).
 #define OLED_I2C        i2c1
@@ -37,15 +42,36 @@
 // Number of ADC reads averaged per control sample.
 #define ADC_AVG_SAMPLES  8u
 
-// 2 full cycles across the 128px screen = 2^32 / 64.
-#define WAVE_PHASE_STEP  67108864u
+typedef enum {
+    WAVE_SINE = 0,
+    WAVE_SQUARE,
+    WAVE_TRIANGLE,
+} wave_kind_t;
 
-// Written by the main loop, read by the audio callback. A single aligned 32-bit
-// store is atomic on the M0+, so no lock is needed.
-static volatile uint32_t g_phase_step;
-static uint32_t g_phase;
+typedef struct {
+    const char *label;
+    uint        adc_gpio;   // pot input
+    uint        adc_chan;   // ADC mux select
+    wave_kind_t wave;
+    uint32_t    phase;      // audio phase accumulator (owned by callback)
+    volatile uint32_t phase_step; // written by main loop, read by callback
+    float       freq;       // smoothed frequency (owned by main loop)
+} voice_t;
+
+static voice_t g_voices[3] = {
+    { "SIN", ADC_SINE_GPIO,   ADC_SINE_CHAN,   WAVE_SINE,     0, 0, DEFAULT_HZ },
+    { "SQR", ADC_SQUARE_GPIO, ADC_SQUARE_CHAN, WAVE_SQUARE,   0, 0, DEFAULT_HZ },
+    { "TRI", ADC_TRI_GPIO,    ADC_TRI_CHAN,    WAVE_TRIANGLE, 0, 0, DEFAULT_HZ },
+};
+
+#define VOICE_COUNT (sizeof(g_voices) / sizeof(g_voices[0]))
+
 static ssd1306_t g_display;
-static uint32_t g_disp_phase;
+static uint32_t g_disp_base; // slow-scrolling phase base for the mixed trace
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 // Map a [-1, +1] waveform value to a PWM duty cycle, leaving headroom at both rails.
 static inline uint16_t wave_to_duty(float v) {
@@ -55,59 +81,118 @@ static inline uint16_t wave_to_duty(float v) {
     return (uint16_t)duty;
 }
 
-// Called by the SDK alarm pool at ~43.5 kHz. Keep it short and allocation-free.
+// Sample a waveform at normalized phase p in [0, 1).
+static inline float waveform_sample(wave_kind_t wave, float p) {
+    switch (wave) {
+        case WAVE_SINE:     return sinf(p * TWO_PI);
+        case WAVE_SQUARE:   return (p < 0.5f) ? 1.0f : -1.0f;
+        case WAVE_TRIANGLE: return (p < 0.5f) ? (4.0f * p - 1.0f) : (3.0f - 4.0f * p);
+        default:            return 0.0f;
+    }
+}
+
+// Read one ADC channel, discarding the first sample after the mux switch and
+// averaging the rest (rejects real noise).
+static uint16_t read_adc_avg(uint chan) {
+    adc_select_input(chan);
+    (void)adc_read(); // discard first sample (mux settling)
+    uint32_t sum = 0;
+    for (uint i = 0; i < ADC_AVG_SAMPLES; i++) {
+        sum += adc_read();
+    }
+    return (uint16_t)(sum / ADC_AVG_SAMPLES);
+}
+
+// Map a 12-bit ADC reading to a frequency in [FREQ_MIN_HZ, FREQ_MAX_HZ].
+static inline float adc_to_freq(uint16_t raw) {
+    return FREQ_MIN_HZ + ((float)raw / 4095.0f) * (FREQ_MAX_HZ - FREQ_MIN_HZ);
+}
+
+// ---------------------------------------------------------------------------
+// Audio: mix all voices into a single PWM output.
+// ---------------------------------------------------------------------------
+
 static bool audio_sample_callback(struct repeating_timer *timer) {
     (void)timer;
 
-    const uint32_t step = g_phase_step;
-    const float phase = (float)g_phase * (TWO_PI / 4294967296.0f);
+    float mix = 0.0f;
+    for (uint i = 0; i < VOICE_COUNT; i++) {
+        voice_t *v = &g_voices[i];
+        const float p = (float)v->phase / 4294967296.0f;
+        mix += waveform_sample(v->wave, p);
+        v->phase += v->phase_step;
+    }
+    mix /= (float)VOICE_COUNT; // normalize back to [-1, +1]
 
-    pwm_set_gpio_level(GPIO_OUT, wave_to_duty(sinf(phase)));
-
-    g_phase += step;
+    pwm_set_gpio_level(AUDIO_GPIO, wave_to_duty(mix));
     return true;
 }
 
-static void update_display(unsigned freq_hz) {
+// ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+
+static void update_display(void) {
     ssd1306_clear(&g_display);
 
-    // Label + big frequency number + unit.
-    ssd1306_draw_text(&g_display, 0, 0, "FREQ", 1);
-
     char buf[8];
-    snprintf(buf, sizeof(buf), "%u", freq_hz);
-    ssd1306_draw_text(&g_display, 0, 8, buf, 3);
+    uint32_t step[VOICE_COUNT];
 
-    int num_width = (int)strlen(buf) * 6 * 3;
-    ssd1306_draw_text(&g_display, num_width + 4, 24, "Hz", 1);
+    for (uint i = 0; i < VOICE_COUNT; i++) {
+        const voice_t *v = &g_voices[i];
+        const int y = (int)i * 9;
 
-    // Live sine trace, slowly scrolling.
-    g_disp_phase += 0x08000000u; // ~1/32 cycle per redraw
-    for (int px = 0; px < SSD1306_WIDTH; px++) {
-        uint32_t ph = g_disp_phase + (uint32_t)((uint64_t)px * WAVE_PHASE_STEP);
-        float v = sinf((float)ph * (TWO_PI / 4294967296.0f));
-        int y = 52 - (int)(11.0f * v);
-        ssd1306_set_pixel(&g_display, px, y, true);
+        ssd1306_draw_text(&g_display, 0, y, v->label, 1);
+        snprintf(buf, sizeof(buf), "%u", (unsigned)v->freq);
+        ssd1306_draw_text(&g_display, 22, y, buf, 1);
+        ssd1306_draw_text(&g_display, 48, y, "Hz", 1);
+
+        // Per-voice per-pixel phase step so the trace reflects the real
+        // frequency ratio (440 Hz -> 2 cycles across the screen).
+        float cycles = v->freq / 220.0f;
+        if (cycles < 0.5f) cycles = 0.5f;
+        if (cycles > 6.0f) cycles = 6.0f;
+        step[i] = (uint32_t)(cycles * 4294967296.0 / (double)SSD1306_WIDTH);
+    }
+
+    // Mixed trace: sum of the three waveforms at their current frequencies.
+    g_disp_base += 0x08000000u;
+    for (int x = 0; x < SSD1306_WIDTH; x++) {
+        float mix = 0.0f;
+        for (uint i = 0; i < VOICE_COUNT; i++) {
+            uint32_t ph = g_disp_base + (uint32_t)((uint64_t)x * step[i]);
+            mix += waveform_sample(g_voices[i].wave, (float)ph / 4294967296.0f);
+        }
+        mix /= (float)VOICE_COUNT;
+        int y = 47 - (int)(15.0f * mix);
+        ssd1306_set_pixel(&g_display, x, y, true);
     }
 
     ssd1306_flush(&g_display);
 }
 
-int main(void) {
-    // Default tone so there is output before the first ADC read settles.
-    g_phase_step = (uint32_t)((DEFAULT_HZ * 4294967296.0) / (double)SAMPLE_RATE_HZ + 0.5);
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
-    // Route GP7 to the PWM peripheral (slice 3, channel B).
-    gpio_set_function(GPIO_OUT, GPIO_FUNC_PWM);
+int main(void) {
+    const uint32_t default_step = (uint32_t)((DEFAULT_HZ * 4294967296.0) / (double)SAMPLE_RATE_HZ + 0.5);
+    for (uint i = 0; i < VOICE_COUNT; i++) {
+        g_voices[i].phase_step = default_step;
+    }
+
+    // Single mixed output on GP7 (slice 3, channel B).
+    gpio_set_function(AUDIO_GPIO, GPIO_FUNC_PWM);
     pwm_config config = pwm_get_default_config();
     pwm_config_set_clkdiv(&config, 1.0f);
     pwm_config_set_wrap(&config, PWM_TOP);
-    pwm_init(pwm_gpio_to_slice_num(GPIO_OUT), &config, true);
+    pwm_init(pwm_gpio_to_slice_num(AUDIO_GPIO), &config, true);
 
-    // Potentiometer ADC.
+    // Potentiometer ADCs.
     adc_init();
-    adc_gpio_init(FREQ_ADC_GPIO);
-    adc_select_input(FREQ_ADC_CHAN);
+    adc_gpio_init(ADC_SINE_GPIO);
+    adc_gpio_init(ADC_SQUARE_GPIO);
+    adc_gpio_init(ADC_TRI_GPIO);
 
     // OLED on I2C1 (GP14 SDA / GP15 SCL).
     i2c_init(OLED_I2C, 400 * 1000);
@@ -127,27 +212,25 @@ int main(void) {
         while (true) tight_loop_contents();
     }
 
-    // Control loop: sample the pot at ~100 Hz, smooth it, then update the phase step.
-    float freq = DEFAULT_HZ;
+    // Control loop: sample the pots at ~100 Hz, smooth, update phase steps.
     uint32_t tick = 0;
     while (true) {
-        uint32_t sum = 0;
-        for (uint i = 0; i < ADC_AVG_SAMPLES; i++) {
-            sum += adc_read();
+        for (uint i = 0; i < VOICE_COUNT; i++) {
+            voice_t *v = &g_voices[i];
+            const uint16_t raw = read_adc_avg(v->adc_chan);
+            const float target = adc_to_freq(raw);
+            v->freq += 0.15f * (target - v->freq); // exponential smoothing
+            v->phase_step = (uint32_t)((v->freq * 4294967296.0) / (double)SAMPLE_RATE_HZ + 0.5);
         }
-        const uint16_t raw = (uint16_t)(sum / ADC_AVG_SAMPLES);
-
-        const float target = FREQ_MIN_HZ + ((float)raw / 4095.0f) * (FREQ_MAX_HZ - FREQ_MIN_HZ);
-        freq += 0.15f * (target - freq); // exponential smoothing
-
-        g_phase_step = (uint32_t)((freq * 4294967296.0) / (double)SAMPLE_RATE_HZ + 0.5);
 
         if ((tick % 10) == 0) { // display refresh at ~10 Hz
-            update_display((unsigned)freq);
+            update_display();
         }
         if ((tick % 20) == 0) { // log every ~200 ms
-            printf("ADC=%4u  freq=%4u Hz  phase_step=%u\n",
-                   raw, (unsigned)freq, (unsigned)g_phase_step);
+            printf("SIN=%4u SQR=%4u TRI=%4u Hz\n",
+                   (unsigned)g_voices[0].freq,
+                   (unsigned)g_voices[1].freq,
+                   (unsigned)g_voices[2].freq);
         }
         tick++;
         sleep_ms(10);

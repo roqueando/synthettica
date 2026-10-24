@@ -68,7 +68,7 @@ void ssd1306_set_pixel(ssd1306_t *d, int x, int y, bool on) {
 }
 
 // 5x7 font, one byte per column, bit 0 = top row.
-static const uint8_t font5x7[20][5] = {
+static const uint8_t font5x7[23][5] = {
     {0x00, 0x00, 0x00, 0x00, 0x00}, // ' '  (0)
     {0x3E, 0x51, 0x49, 0x45, 0x3E}, // '0'  (1)
     {0x00, 0x42, 0x7F, 0x40, 0x00}, // '1'
@@ -89,6 +89,9 @@ static const uint8_t font5x7[20][5] = {
     {0x26, 0x49, 0x49, 0x49, 0x32}, // 'S'
     {0x00, 0x41, 0x7F, 0x41, 0x00}, // 'I'
     {0x7F, 0x04, 0x08, 0x10, 0x7F}, // 'N'
+    {0x01, 0x01, 0x7F, 0x01, 0x01}, // 'T'  (20)
+    {0x7E, 0x11, 0x11, 0x11, 0x7E}, // 'A'
+    {0x3F, 0x40, 0x38, 0x40, 0x3F}, // 'W'
 };
 
 static int font_index(char c) {
@@ -104,6 +107,9 @@ static int font_index(char c) {
         case 'S': return 17;
         case 'I': return 18;
         case 'N': return 19;
+        case 'T': return 20;
+        case 'A': return 21;
+        case 'W': return 22;
         default: return 0;
     }
 }
